@@ -1,0 +1,61 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use File::Slurp qw(read_file);
+use JSON;
+use DBI;
+
+my $json = decode_json(read_file($ARGV[0]));
+my $uuid = $json->{'uuid'};
+my $gui = $json->{'gui'};
+if ( !$gui ) { $gui = 'UNKNOWN'; }
+my $mm_version = $json->{'mm_version'};
+my $started_at = int($json->{'events'}[0]{'timestamp'}/1000);
+my $taker_coin = $json->{'taker_coin'};
+if (!$taker_coin) { print "really old taker in swap: $uuid\n"; exit 1; }
+my $taker_amount = sprintf("%.8f",$json->{'taker_amount'});
+my $maker_coin = $json->{'maker_coin'};
+my $maker_amount = sprintf("%.8f",$json->{'maker_amount'});
+my $events = $json->{'events'};
+my $error_events = $json->{'error_events'};
+my $error_msg = '';
+my $error_type = '';
+
+LOOP: foreach my $event( @$events ) {
+    my $event_type = $event->{'event'}{'type'};
+    foreach my $error( @$error_events ) {
+        if ( $event_type eq $error ) {
+            $error_type = $event->{'event'}{'type'};
+            $error_msg = $event->{'event'}{'data'}{'error'};
+            last LOOP;
+        }
+    }
+}
+
+### MariaDB on localhost, username swaps, pwd xxxxx
+my $dbh = DBI->connect('DBI:MariaDB:database=swaps;host=localhost','swaps', q(xxxxx),{ RaiseError => 1, PrintError => 0 });
+if ( $error_msg ne '' ) {
+    $error_msg = $dbh->quote($error_msg);
+    if (index($ARGV[0], 'MAKER') != -1) {
+        my $taker_pubkey = $json->{'events'}[0]{'event'}{'data'}{'taker'};
+        if ( !$taker_pubkey ) { $taker_pubkey = 'UNKNOWN'; }
+        $dbh->do("INSERT INTO swaps_failed (uuid,started_at,taker_coin,taker_amount,maker_coin,maker_amount,maker_error_type,maker_error_msg,maker_gui,maker_version,taker_pubkey) VALUES ('$uuid',FROM_UNIXTIME($started_at),'$taker_coin',$taker_amount,'$maker_coin',$maker_amount,'$error_type',$error_msg,'$gui','$mm_version','$taker_pubkey') ON DUPLICATE KEY UPDATE maker_error_type='$error_type',maker_error_msg=$error_msg,maker_gui='$gui',maker_version='$mm_version',taker_pubkey='$taker_pubkey'");
+    } else {
+        my $maker_pubkey = $json->{'events'}[0]{'event'}{'data'}{'maker'};
+        if ( !$maker_pubkey ) { $maker_pubkey = 'UNKNOWN'; }
+        $dbh->do("INSERT INTO swaps_failed (uuid,started_at,taker_coin,taker_amount,maker_coin,maker_amount,taker_error_type,taker_error_msg,taker_gui,taker_version,maker_pubkey) VALUES ('$uuid',FROM_UNIXTIME($started_at),'$taker_coin',$taker_amount,'$maker_coin',$maker_amount,'$error_type',$error_msg,'$gui','$mm_version','$maker_pubkey') ON DUPLICATE KEY UPDATE taker_error_type='$error_type',taker_error_msg=$error_msg,taker_gui='$gui',taker_version='$mm_version',maker_pubkey='$maker_pubkey'");
+    }
+    #print "failed swap\n";
+} else {
+    if (index($ARGV[0], 'MAKER') != -1) {
+        my $taker_pubkey = $json->{'events'}[0]{'event'}{'data'}{'taker'};
+        $dbh->do("INSERT INTO swaps (uuid,started_at,taker_coin,taker_amount,maker_coin,maker_amount,maker_gui,maker_version,taker_pubkey) VALUES ('$uuid',FROM_UNIXTIME($started_at),'$taker_coin',$taker_amount,'$maker_coin',$maker_amount,'$gui','$mm_version','$taker_pubkey') ON DUPLICATE KEY UPDATE maker_gui='$gui',maker_version='$mm_version',taker_pubkey='$taker_pubkey'");
+    } else {
+        my $maker_pubkey = $json->{'events'}[0]{'event'}{'data'}{'maker'};
+        $dbh->do("INSERT INTO swaps (uuid,started_at,taker_coin,taker_amount,maker_coin,maker_amount,taker_gui,taker_version,maker_pubkey) VALUES ('$uuid',FROM_UNIXTIME($started_at),'$taker_coin',$taker_amount,'$maker_coin',$maker_amount,'$gui','$mm_version','$maker_pubkey') ON DUPLICATE KEY UPDATE taker_gui='$gui',taker_version='$mm_version',maker_pubkey='$maker_pubkey'");
+    }
+    #print "ok\n";
+}
+$dbh->disconnect();
+
